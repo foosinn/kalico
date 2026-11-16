@@ -30,6 +30,48 @@ MAX_SEGMENT_NOISE_FRACTION = 0.25
 FLAT_SIGMA = 5.0
 
 
+def as_load_cell(obj) -> LoadCell | None:
+    # [load_cell] registers a LoadCell directly. [load_cell_probe]
+    # registers a LoadCellPrinterProbe that owns one privately, and
+    # exposes no accessor for it.
+    if isinstance(obj, LoadCell):
+        return obj
+    for attr in ("get_load_cell", "_load_cell"):
+        inner = getattr(obj, attr, None)
+        if callable(inner):
+            inner = inner()
+        if isinstance(inner, LoadCell):
+            return inner
+    return None
+
+
+def find_load_cell(printer, gcmd) -> tuple[str, LoadCell]:
+    wanted = gcmd.get("LOAD_CELL", None)
+    found: dict[str, LoadCell] = {}
+    for obj_name, obj in printer.lookup_objects():
+        load_cell = as_load_cell(obj)
+        if load_cell is not None:
+            found[obj_name] = load_cell
+    if not found:
+        raise gcmd.error(
+            "No load cell found. Configure [load_cell] or [load_cell_probe]."
+        )
+    if wanted is None:
+        if len(found) > 1:
+            raise gcmd.error(
+                "Multiple load cells found, pass LOAD_CELL=<name>: %s"
+                % (", ".join(sorted(found)))
+            )
+        return next(iter(found.items()))
+    for obj_name, load_cell in found.items():
+        if wanted in (obj_name, obj_name.split()[-1]):
+            return obj_name, load_cell
+    raise gcmd.error(
+        "Unknown load cell '%s', known: %s"
+        % (wanted, ", ".join(sorted(found)))
+    )
+
+
 class Segment:
     def __init__(self, label, start, end, flow):
         self.label = label
@@ -64,54 +106,12 @@ class LoadCellFlowTest:
             desc=self.cmd_LOAD_CELL_FLOW_TEST_help,
         )
 
-    @staticmethod
-    def _as_load_cell(obj) -> LoadCell | None:
-        # [load_cell] registers a LoadCell directly. [load_cell_probe]
-        # registers a LoadCellPrinterProbe that owns one privately, and
-        # exposes no accessor for it.
-        if isinstance(obj, LoadCell):
-            return obj
-        for attr in ("get_load_cell", "_load_cell"):
-            inner = getattr(obj, attr, None)
-            if callable(inner):
-                inner = inner()
-            if isinstance(inner, LoadCell):
-                return inner
-        return None
-
-    def _find_load_cell(self, gcmd) -> tuple[str, LoadCell]:
-        wanted = gcmd.get("LOAD_CELL", None)
-        found: dict[str, LoadCell] = {}
-        for obj_name, obj in self.printer.lookup_objects():
-            load_cell = self._as_load_cell(obj)
-            if load_cell is not None:
-                found[obj_name] = load_cell
-        if not found:
-            raise gcmd.error(
-                "No load cell found. Configure [load_cell] or "
-                "[load_cell_probe]."
-            )
-        if wanted is None:
-            if len(found) > 1:
-                raise gcmd.error(
-                    "Multiple load cells found, pass LOAD_CELL=<name>: %s"
-                    % (", ".join(sorted(found)))
-                )
-            return next(iter(found.items()))
-        for obj_name, load_cell in found.items():
-            if wanted in (obj_name, obj_name.split()[-1]):
-                return obj_name, load_cell
-        raise gcmd.error(
-            "Unknown load cell '%s', known: %s"
-            % (wanted, ", ".join(sorted(found)))
-        )
-
     cmd_LOAD_CELL_FLOW_TEST_help = (
         "Extrude into free air and report load cell force vs flow rate"
     )
 
     def cmd_LOAD_CELL_FLOW_TEST(self, gcmd):
-        lc_name, load_cell = self._find_load_cell(gcmd)
+        lc_name, load_cell = find_load_cell(self.printer, gcmd)
         toolhead = self.printer.lookup_object("toolhead")
         gcode = self.printer.lookup_object("gcode")
         extruder = toolhead.get_extruder()
