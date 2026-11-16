@@ -119,6 +119,7 @@ class PressureAdvanceCalibrate:
         xy_speed = gcmd.get_float("TRAVEL_SPEED", 60.0, above=0.0)
         duration = gcmd.get_float("DURATION", 0.8, minval=0.2, maxval=5.0)
         settle = gcmd.get_float("SETTLE", 0.5, minval=0.2, maxval=5.0)
+        lead = gcmd.get_float("LEAD", 0.3, minval=0.1, maxval=5.0)
         threshold = gcmd.get_float("THRESHOLD", 2.0, above=0.0)
 
         area = extruder.filament_area
@@ -140,8 +141,9 @@ class PressureAdvanceCalibrate:
         y0 = gcmd.get_float("Y", gc_pos[1])
         z0 = gcmd.get_float("Z", gc_pos[2])
         seg_len = xy_speed * duration
+        lead_len = xy_speed * lead
         x_offset = th_pos[0] - gc_pos[0]
-        x_end = x0 + 3.0 * seg_len
+        x_end = x0 + 3.0 * seg_len + 2.0 * lead_len
         x_max = status.get("axis_maximum")
         if x_max is not None and x_end + x_offset > x_max[0]:
             raise gcmd.error(
@@ -157,8 +159,8 @@ class PressureAdvanceCalibrate:
             value += step
         gcmd.respond_info(
             "Sweeping %i pressure advance values on '%s': %.4f to %.4f. "
-            "%.1f->%.1f mm^3/s at %.0fmm/s, %.1fmm per segment, Z=%.1f. "
-            "Extruding into free air."
+            "%.1f->%.1f mm^3/s at %.0fmm/s, %.1fmm per segment plus %.1fmm "
+            "lead in/out, X %.1f to %.1f, Z=%.1f. Extruding into free air."
             % (
                 len(advances),
                 lc_name,
@@ -168,6 +170,9 @@ class PressureAdvanceCalibrate:
                 flow_high,
                 xy_speed,
                 seg_len,
+                lead_len,
+                x0,
+                x_end,
                 z0,
             )
         )
@@ -190,12 +195,14 @@ class PressureAdvanceCalibrate:
                         y0,
                         z0,
                         seg_len,
+                        lead_len,
                         xy_speed,
                         area,
                         flow_low,
                         flow_high,
                         duration,
                         settle,
+                        lead,
                     )
                 )
         finally:
@@ -215,12 +222,14 @@ class PressureAdvanceCalibrate:
         y0,
         z0,
         seg_len,
+        lead_len,
         xy_speed,
         area,
         flow_low,
         flow_high,
         duration,
         settle,
+        lead,
     ):
         gcode.run_script_from_command(
             "SET_PRESSURE_ADVANCE ADVANCE=%.6f" % (advance,)
@@ -228,9 +237,19 @@ class PressureAdvanceCalibrate:
         gcode.run_script_from_command(
             "G1 X%.3f Y%.3f Z%.3f F%.0f" % (x0, y0, z0, xy_speed * 60.0)
         )
-        e_low = flow_low * duration / area
-        e_high = flow_high * duration / area
         feed = xy_speed * 60.0
+        # Lead in and lead out at the same speed and the low flow, so
+        # that acceleration and deceleration happen outside every
+        # measured window. Without them the settled window of the last
+        # segment sits in the decel ramp and reads toolhead inertia
+        # instead of melt pressure.
+        plan = (
+            ("lead_end", lead_len, flow_low * lead / area),
+            ("slow_end", seg_len, flow_low * duration / area),
+            ("fast_end", seg_len, flow_high * duration / area),
+            ("slow2_end", seg_len, flow_low * duration / area),
+            ("out_end", lead_len, flow_low * lead / area),
+        )
 
         collector = load_cell.get_collector()
         marks = {}
@@ -250,12 +269,11 @@ class PressureAdvanceCalibrate:
         # them, so the lookahead blends them and the flow step stays
         # sharp. Lookahead callbacks give the exact boundary print time
         # without forcing a stop.
-        for index, (label, e_dist) in enumerate(
-            (("slow_end", e_low), ("fast_end", e_high), ("slow2_end", e_low))
-        ):
+        x_target = x0
+        for label, dist, e_dist in plan:
+            x_target += dist
             gcode.run_script_from_command(
-                "G1 X%.4f E%.4f F%.0f"
-                % (x0 + (index + 1) * seg_len, e_dist, feed)
+                "G1 X%.4f E%.4f F%.0f" % (x_target, e_dist, feed)
             )
             mark(label)
         toolhead.dwell(settle)
@@ -267,7 +285,13 @@ class PressureAdvanceCalibrate:
         return self._analyse(gcmd, load_cell, advance, samples, marks, t_start)
 
     def _analyse(self, gcmd, load_cell, advance, samples, marks, t_start):
-        for label in ("idle_end", "slow_end", "fast_end", "slow2_end"):
+        for label in (
+            "idle_end",
+            "lead_end",
+            "slow_end",
+            "fast_end",
+            "slow2_end",
+        ):
             if label not in marks:
                 raise gcmd.error(
                     "Lookahead callback '%s' never fired" % (label,)
@@ -281,7 +305,7 @@ class PressureAdvanceCalibrate:
         slow_raw = [
             s[column]
             for s in samples
-            if marks["idle_end"]
+            if marks["lead_end"]
             <= s[SampleStructure.TIME.value]
             <= marks["slow_end"]
         ]
@@ -312,8 +336,11 @@ class PressureAdvanceCalibrate:
         step = fast_level - slow_level
         if noise > 0.0 and step < MIN_STEP_SIGMA * noise:
             raise gcmd.error(
-                "Flow step is only %.1f sigma above noise. Widen FLOW_LOW to "
-                "FLOW_HIGH." % (step / noise,)
+                "Flow step is only %.1f sigma above noise (fast settled "
+                "%.0f, slow settled %.0f, noise %.0f counts). A negative "
+                "step means something other than flow is loading the cell "
+                "in the measured windows."
+                % (step / noise, fast_level, slow_level, noise)
             )
         result = PassResult(advance)
         result.step = step
