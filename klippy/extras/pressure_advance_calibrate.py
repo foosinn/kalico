@@ -112,24 +112,39 @@ class PressureAdvanceCalibrate:
         step = gcmd.get_float("STEP", 0.005, above=0.0)
         if stop <= start:
             raise gcmd.error("STOP must be greater than START")
-        flow_low = gcmd.get_float("FLOW_LOW", 5.0, above=0.0)
-        flow_high = gcmd.get_float("FLOW_HIGH", 15.0, above=0.0)
+        flow_low = gcmd.get_float("FLOW_LOW", 4.0, above=0.0)
+        flow_high = gcmd.get_float("FLOW_HIGH", 6.0, above=0.0)
         if flow_high <= flow_low:
             raise gcmd.error("FLOW_HIGH must be greater than FLOW_LOW")
-        xy_speed = gcmd.get_float("TRAVEL_SPEED", 60.0, above=0.0)
+        xy_speed = gcmd.get_float("TRAVEL_SPEED", 5.0, above=0.0)
         duration = gcmd.get_float("DURATION", 0.8, minval=0.2, maxval=5.0)
         settle = gcmd.get_float("SETTLE", 0.5, minval=0.2, maxval=5.0)
         lead = gcmd.get_float("LEAD", 0.3, minval=0.1, maxval=5.0)
         threshold = gcmd.get_float("THRESHOLD", 2.0, above=0.0)
 
         area = extruder.filament_area
-        max_cross = extruder.max_extrude_ratio * area
         cross_high = flow_high / xy_speed
-        if cross_high > max_cross:
+        # Slow travel keeps the purge in one place, which means a fat
+        # extrusion. max_extrude_cross_section exists to catch slicer
+        # mistakes and is not meaningful here, so raise it for the sweep
+        # and put it back afterwards.
+        old_nozzle = extruder.nozzle_diameter
+        old_cross = extruder.max_extrude_ratio * area
+        need_cross = cross_high * 1.5
+        # The lookahead limits junction speed between the flow segments
+        # to instantaneous_corner_velocity / the change in extrusion
+        # ratio. Travel speed cancels out of that, leaving a condition on
+        # the flow difference alone. Breach it and XY decelerates right
+        # at the step, putting an inertial transient on the edge being
+        # measured and smearing the step itself.
+        max_flow_step = extruder.instant_corner_v * area
+        if flow_high - flow_low > max_flow_step:
             raise gcmd.error(
-                "FLOW_HIGH needs a %.3fmm^2 extrusion at %.0fmm/s, over the "
-                "%.3fmm^2 max_extrude_cross_section. Raise TRAVEL_SPEED or "
-                "lower FLOW_HIGH." % (cross_high, xy_speed, max_cross)
+                "A %.2f mm^3/s flow step makes the lookahead slow XY down at "
+                "the transition, which smears the edge and adds an inertial "
+                "transient to it. Keep FLOW_HIGH - FLOW_LOW under %.2f "
+                "mm^3/s, or raise instantaneous_corner_velocity in "
+                "[extruder]." % (flow_high - flow_low, max_flow_step)
             )
 
         # G1 targets are in gcode coordinates, the axis limits are in
@@ -181,6 +196,12 @@ class PressureAdvanceCalibrate:
         gcode.run_script_from_command("SAVE_GCODE_STATE NAME=_pa_calibrate")
         results = []
         try:
+            if need_cross > old_cross:
+                gcode.run_script_from_command(
+                    "SET_NOZZLE_DIAMETER DIAMETER=%.4f "
+                    "MAX_EXTRUDE_CROSS_SECTION=%.4f"
+                    % (old_nozzle, need_cross)
+                )
             gcode.run_script_from_command("G90")
             gcode.run_script_from_command("M83")
             for advance in advances:
@@ -206,6 +227,12 @@ class PressureAdvanceCalibrate:
                     )
                 )
         finally:
+            if need_cross > old_cross:
+                gcode.run_script_from_command(
+                    "SET_NOZZLE_DIAMETER DIAMETER=%.4f "
+                    "MAX_EXTRUDE_CROSS_SECTION=%.4f"
+                    % (old_nozzle, old_cross)
+                )
             gcode.run_script_from_command(
                 "RESTORE_GCODE_STATE NAME=_pa_calibrate MOVE=0"
             )
