@@ -233,8 +233,10 @@ class LoadCellFlowTest:
         if drift > MAX_DRIFT_FRACTION * step_delta:
             problems.append(
                 "baseline did not return (%.0f%% of the measured step is "
-                "still there after extrusion stopped) - the extrudate is "
-                "probably touching the bed or the nozzle; park Z higher"
+                "still there after extrusion stopped). Something mechanical "
+                "changed and stayed changed: extrudate fouling the bed or "
+                "nozzle, or a preloaded toolhead coupling reseating. Park Z "
+                "high and re-run with filament unloaded to tell them apart"
                 % (100.0 * drift / step_delta,)
             )
         noise_limit = MAX_SEGMENT_NOISE_FRACTION * step_delta
