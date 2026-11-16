@@ -26,6 +26,8 @@ MAX_DRIFT_FRACTION = 0.1
 # A segment whose own noise is this big a fraction of the step is not
 # a steady state measurement.
 MAX_SEGMENT_NOISE_FRACTION = 0.25
+# Below this many sigma the trace is flat, not merely untrustworthy.
+FLAT_SIGMA = 5.0
 
 
 class Segment:
@@ -225,6 +227,18 @@ class LoadCellFlowTest:
             "High flow vs low flow: %.1f sigma" % (step_delta / noise,)
         )
         snr = step_delta / noise
+        # A flat trace is its own answer. Report it before the steadiness
+        # gates, which divide by a step that is itself noise here and so
+        # produce meaningless percentages.
+        if high_delta < FLAT_SIGMA * noise and step_delta < FLAT_SIGMA * noise:
+            gcmd.respond_info(
+                "Verdict: FLAT. Force does not respond to flow rate "
+                "(%.1f sigma at high flow). With filament loaded that means "
+                "this load cell does not see extrusion force. With no "
+                "filament loaded that is the expected null result."
+                % (high_delta / noise,)
+            )
+            return
         # Sanity gates. Melt back-pressure relaxes when the extruder stops
         # and is steady within a segment. Anything else means the cell is
         # picking up something mechanical - usually extrudate fouling the
