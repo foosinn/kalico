@@ -12,7 +12,10 @@
 # This file may be distributed under the terms of the GNU GPLv3 license.
 from __future__ import annotations
 
+import csv
+import os
 import statistics
+import time
 
 from klippy.extras.load_cell.load_cell import SampleStructure
 from klippy.extras.load_cell_flow_test import find_load_cell
@@ -195,6 +198,7 @@ class PressureAdvanceCalibrate:
         gcode = self.printer.lookup_object("gcode")
         gcode.run_script_from_command("SAVE_GCODE_STATE NAME=_pa_calibrate")
         results = []
+        rows = []
         try:
             if need_cross > old_cross:
                 gcode.run_script_from_command(
@@ -205,27 +209,27 @@ class PressureAdvanceCalibrate:
             gcode.run_script_from_command("G90")
             gcode.run_script_from_command("M83")
             for advance in advances:
-                results.append(
-                    self._run_pass(
-                        gcmd,
-                        load_cell,
-                        toolhead,
-                        gcode,
-                        advance,
-                        x0,
-                        y0,
-                        z0,
-                        seg_len,
-                        lead_len,
-                        xy_speed,
-                        area,
-                        flow_low,
-                        flow_high,
-                        duration,
-                        settle,
-                        lead,
-                    )
+                result, pass_rows = self._run_pass(
+                    gcmd,
+                    load_cell,
+                    toolhead,
+                    gcode,
+                    advance,
+                    x0,
+                    y0,
+                    z0,
+                    seg_len,
+                    lead_len,
+                    xy_speed,
+                    area,
+                    flow_low,
+                    flow_high,
+                    duration,
+                    settle,
+                    lead,
                 )
+                results.append(result)
+                rows.extend(pass_rows)
         finally:
             if need_cross > old_cross:
                 gcode.run_script_from_command(
@@ -236,7 +240,25 @@ class PressureAdvanceCalibrate:
             gcode.run_script_from_command(
                 "RESTORE_GCODE_STATE NAME=_pa_calibrate MOVE=0"
             )
+        self._write_csv(gcmd, rows)
         self._report(gcmd, results, threshold)
+
+    def _write_csv(self, gcmd, rows):
+        log_file = self.printer.get_start_args().get("log_file")
+        directory = os.path.dirname(log_file) if log_file else "/tmp"
+        name = "pa_calibrate_%s.csv" % (time.strftime("%Y%m%d_%H%M%S"),)
+        path = os.path.join(directory, name)
+        try:
+            with open(path, "w", newline="") as handle:
+                writer = csv.writer(handle)
+                writer.writerow(
+                    ["advance", "time", "counts", "force_g", "segment"]
+                )
+                writer.writerows(rows)
+        except OSError as err:
+            gcmd.respond_info("Could not write %s: %s" % (path, err))
+            return
+        gcmd.respond_info("Raw force trace written to %s" % (path,))
 
     def _run_pass(
         self,
@@ -309,7 +331,41 @@ class PressureAdvanceCalibrate:
         if not samples:
             raise gcmd.error("No samples returned from sensor!")
         load_cell.validate_samples(samples, errors)
-        return self._analyse(gcmd, load_cell, advance, samples, marks, t_start)
+        result = self._analyse(
+            gcmd, load_cell, advance, samples, marks, t_start
+        )
+        return result, self._rows(advance, samples, marks, t_start)
+
+    @staticmethod
+    def _rows(advance, samples, marks, t_start):
+        # Label each sample with the segment it falls in, so a plot can
+        # show where the analysis windows actually sat.
+        bounds = [
+            ("idle", marks["idle_end"]),
+            ("lead", marks["lead_end"]),
+            ("slow", marks["slow_end"]),
+            ("fast", marks["fast_end"]),
+            ("slow2", marks["slow2_end"]),
+            ("out", marks["out_end"]),
+        ]
+        rows = []
+        for sample in samples:
+            when = sample[SampleStructure.TIME.value]
+            label = "tail"
+            for name, end in bounds:
+                if when <= end:
+                    label = name
+                    break
+            rows.append(
+                [
+                    "%.6f" % (advance,),
+                    "%.6f" % (when - t_start,),
+                    sample[SampleStructure.COUNTS.value],
+                    "%.3f" % (sample[SampleStructure.FORCE_G.value],),
+                    label,
+                ]
+            )
+        return rows
 
     def _analyse(self, gcmd, load_cell, advance, samples, marks, t_start):
         for label in (
@@ -318,6 +374,7 @@ class PressureAdvanceCalibrate:
             "slow_end",
             "fast_end",
             "slow2_end",
+            "out_end",
         ):
             if label not in marks:
                 raise gcmd.error(
