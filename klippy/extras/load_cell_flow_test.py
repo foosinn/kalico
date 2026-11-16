@@ -21,6 +21,11 @@ from klippy.extras.load_cell.load_cell import (
 # the accel/decel ramp and the pressure transient.
 TRIM_FRACTION = 0.25
 MIN_SEGMENT_SAMPLES = 8
+# Baseline must relax to within this fraction of the measured step.
+MAX_DRIFT_FRACTION = 0.1
+# A segment whose own noise is this big a fraction of the step is not
+# a steady state measurement.
+MAX_SEGMENT_NOISE_FRACTION = 0.25
 
 
 class Segment:
@@ -174,6 +179,7 @@ class LoadCellFlowTest:
             )
         if not samples:
             raise gcmd.error("No samples returned from sensor!")
+        load_cell.validate_samples(samples, errors)
         column = SampleStructure.COUNTS.value
         for seg in segments:
             if not seg.measure(samples, column):
@@ -219,6 +225,39 @@ class LoadCellFlowTest:
             "High flow vs low flow: %.1f sigma" % (step_delta / noise,)
         )
         snr = step_delta / noise
+        # Sanity gates. Melt back-pressure relaxes when the extruder stops
+        # and is steady within a segment. Anything else means the cell is
+        # picking up something mechanical - usually extrudate fouling the
+        # nozzle or the bed - and the separation figure is meaningless.
+        problems = []
+        if drift > MAX_DRIFT_FRACTION * step_delta:
+            problems.append(
+                "baseline did not return (%.0f%% of the measured step is "
+                "still there after extrusion stopped) - the extrudate is "
+                "probably touching the bed or the nozzle; park Z higher"
+                % (100.0 * drift / step_delta,)
+            )
+        noise_limit = MAX_SEGMENT_NOISE_FRACTION * step_delta
+        for seg in segments:
+            if seg.flow and seg.stddev > noise_limit:
+                problems.append(
+                    "'%s' never reached steady state (noise %.0f%% of the "
+                    "step)" % (seg.label, 100.0 * seg.stddev / step_delta)
+                )
+        low_delta = abs(by_label["low"].mean - idle.mean)
+        if low_delta > high_delta:
+            problems.append(
+                "low flow loaded the cell more than high flow - force is not "
+                "tracking flow rate"
+            )
+        if problems:
+            gcmd.respond_info(
+                "Verdict: INCONCLUSIVE (%.1f sigma separation, but the data "
+                "is not trustworthy):" % (snr,)
+            )
+            for problem in problems:
+                gcmd.respond_info("  - " + problem)
+            return
         if snr >= 20.0:
             verdict = (
                 "STRONG. This load cell sees melt back-pressure. Load-cell "
