@@ -57,18 +57,33 @@ class LoadCellFlowTest:
             desc=self.cmd_LOAD_CELL_FLOW_TEST_help,
         )
 
+    @staticmethod
+    def _as_load_cell(obj) -> LoadCell | None:
+        # [load_cell] registers a LoadCell directly. [load_cell_probe]
+        # registers a LoadCellPrinterProbe that owns one privately, and
+        # exposes no accessor for it.
+        if isinstance(obj, LoadCell):
+            return obj
+        for attr in ("get_load_cell", "_load_cell"):
+            inner = getattr(obj, attr, None)
+            if callable(inner):
+                inner = inner()
+            if isinstance(inner, LoadCell):
+                return inner
+        return None
+
     def _find_load_cell(self, gcmd) -> tuple[str, LoadCell]:
         wanted = gcmd.get("LOAD_CELL", None)
         found: dict[str, LoadCell] = {}
         for obj_name, obj in self.printer.lookup_objects():
-            if obj_name.split()[0] not in ("load_cell", "load_cell_probe"):
-                continue
-            if isinstance(obj, LoadCell):
-                found[obj_name] = obj
-            elif hasattr(obj, "get_load_cell"):
-                found[obj_name] = obj.get_load_cell()
+            load_cell = self._as_load_cell(obj)
+            if load_cell is not None:
+                found[obj_name] = load_cell
         if not found:
-            raise gcmd.error("No [load_cell] or [load_cell_probe] configured")
+            raise gcmd.error(
+                "No load cell found. Configure [load_cell] or "
+                "[load_cell_probe]."
+            )
         if wanted is None:
             if len(found) > 1:
                 raise gcmd.error(
