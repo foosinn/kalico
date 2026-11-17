@@ -85,6 +85,8 @@ class PassResult:
         self.undershoot_pct = 0.0
         self.overshoot_pct = 0.0
         self.drift_pct = 0.0
+        self.spread = 0.0
+        self.edges = 0
 
 
 class PressureAdvanceCalibrate:
@@ -117,14 +119,14 @@ class PressureAdvanceCalibrate:
         step = gcmd.get_float("STEP", 0.01, above=0.0)
         if stop <= start:
             raise gcmd.error("STOP must be greater than START")
-        flow_low = gcmd.get_float("FLOW_LOW", 4.0, above=0.0)
-        flow_high = gcmd.get_float("FLOW_HIGH", 6.0, above=0.0)
+        flow_low = gcmd.get_float("FLOW_LOW", 5.0, above=0.0)
+        flow_high = gcmd.get_float("FLOW_HIGH", 30.0, above=0.0)
         if flow_high <= flow_low:
             raise gcmd.error("FLOW_HIGH must be greater than FLOW_LOW")
         xy_speed = gcmd.get_float("TRAVEL_SPEED", 2.0, above=0.0)
-        duration = gcmd.get_float("DURATION", 0.8, minval=0.2, maxval=5.0)
-        cycles = gcmd.get_int("CYCLES", 4, minval=2, maxval=20)
-        prime = gcmd.get_float("PRIME", 5.0, minval=0.0, maxval=60.0)
+        duration = gcmd.get_float("DURATION", 2.0, minval=0.2, maxval=10.0)
+        cycles = gcmd.get_int("CYCLES", 5, minval=2, maxval=20)
+        prime = gcmd.get_float("PRIME", 90.0, minval=0.0, maxval=600.0)
         settle = gcmd.get_float("SETTLE", 0.5, minval=0.2, maxval=5.0)
         threshold = gcmd.get_float("THRESHOLD", 2.0, above=0.0)
         seed = gcmd.get_int("SEED", 0)
@@ -133,14 +135,21 @@ class PressureAdvanceCalibrate:
         # The lookahead caps junction speed between flow segments at
         # instantaneous_corner_velocity / the change in extrusion ratio.
         # Travel speed cancels out, leaving a limit on the flow step.
-        max_flow_step = extruder.instant_corner_v * area
-        if flow_high - flow_low > max_flow_step:
-            raise gcmd.error(
-                "A %.2f mm^3/s flow step makes the lookahead slow XY down at "
-                "the transition, which smears the edge and puts an inertial "
-                "transient on it. Keep FLOW_HIGH - FLOW_LOW under %.2f "
-                "mm^3/s, or raise instantaneous_corner_velocity in "
-                "[extruder]." % (flow_high - flow_low, max_flow_step)
+        # Pressure advance injects pa * (change in extruder velocity), so
+        # the flow step is what sets the signal, not the absolute flow.
+        # instantaneous_corner_velocity caps that step: breach it and the
+        # lookahead decelerates XY at the transition, smearing the edge
+        # and putting an inertial transient on it. It is only read by
+        # PrinterExtruder.calc_junction, so raise it for the sweep and
+        # put it back afterwards rather than making the user edit config.
+        old_corner_v = extruder.instant_corner_v
+        need_corner_v = (flow_high - flow_low) / area * 1.2
+        if need_corner_v > old_corner_v:
+            gcmd.respond_info(
+                "Raising instantaneous_corner_velocity %.2f -> %.2f mm/s for "
+                "the sweep so a %.1f mm^3/s flow step does not slow XY at "
+                "the transition."
+                % (old_corner_v, need_corner_v, flow_high - flow_low)
             )
         # Slow travel keeps the purge local, which means a fat extrusion.
         # max_extrude_cross_section guards against slicer mistakes and is
@@ -188,6 +197,8 @@ class PressureAdvanceCalibrate:
                     "SET_NOZZLE_DIAMETER DIAMETER=%.4f "
                     "MAX_EXTRUDE_CROSS_SECTION=%.4f" % (old_nozzle, need_cross)
                 )
+            if need_corner_v > old_corner_v:
+                extruder.instant_corner_v = need_corner_v
             gcode.run_script_from_command("G90")
             gcode.run_script_from_command("M83")
             samples, idle_end, t_start = self._run(
@@ -195,6 +206,7 @@ class PressureAdvanceCalibrate:
                 xy_speed, area, settle
             )
         finally:
+            extruder.instant_corner_v = old_corner_v
             if need_cross > old_cross:
                 gcode.run_script_from_command(
                     "SET_NOZZLE_DIAMETER DIAMETER=%.4f "
@@ -357,40 +369,55 @@ class PressureAdvanceCalibrate:
             b = move.start + span * hi
             return [p for p in pairs if a <= p[0] <= b]
 
+        # Skip the cycles right after a K change, then average every
+        # remaining edge. Scatter falls roughly as sqrt(edges).
+        skip = min(2, cycles - 2)
         results = []
         for k_idx, advance in enumerate(order):
-            fast = by_label["k%d_c%d_fast" % (k_idx, cycles - 2)]
-            slow = by_label["k%d_c%d_slow" % (k_idx, cycles - 1)]
-            fast_tail = window_of(fast, 1.0 - SETTLED_FRACTION, 1.0)
-            slow_tail = window_of(slow, 1.0 - SETTLED_FRACTION, 1.0)
-            dip_window = window_of(slow, 0.0, DIP_FRACTION)
-            peak_window = window_of(fast, 0.0, DIP_FRACTION)
-            if not (fast_tail and slow_tail and dip_window and peak_window):
-                raise gcmd.error(
-                    "Empty analysis window at advance %.4f - raise DURATION"
-                    % (advance,)
+            steps, unders, overs, drifts = [], [], [], []
+            for cycle in range(skip, cycles - 1):
+                fast = by_label["k%d_c%d_fast" % (k_idx, cycle)]
+                slow = by_label["k%d_c%d_slow" % (k_idx, cycle + 1)]
+                fast_tail = window_of(fast, 1.0 - SETTLED_FRACTION, 1.0)
+                slow_tail = window_of(slow, 1.0 - SETTLED_FRACTION, 1.0)
+                dip_window = window_of(slow, 0.0, DIP_FRACTION)
+                peak_window = window_of(fast, 0.0, DIP_FRACTION)
+                if not (fast_tail and slow_tail and dip_window
+                        and peak_window):
+                    raise gcmd.error(
+                        "Empty analysis window at advance %.4f - raise "
+                        "DURATION" % (advance,)
+                    )
+                fast_level = statistics.fmean([p[1] for p in fast_tail])
+                slow_level = statistics.fmean([p[1] for p in slow_tail])
+                step = fast_level - slow_level
+                if noise > 0.0 and step < MIN_STEP_SIGMA * noise:
+                    raise gcmd.error(
+                        "Flow step at advance %.4f is only %.1f sigma above "
+                        "noise (fast %.0f, slow %.0f, noise %.0f counts)."
+                        % (advance, step / noise, fast_level, slow_level,
+                           noise)
+                    )
+                steps.append(step)
+                unders.append(
+                    100.0 * (slow_level - min(p[1] for p in dip_window)) / step
                 )
-            fast_level = statistics.fmean([p[1] for p in fast_tail])
-            slow_level = statistics.fmean([p[1] for p in slow_tail])
-            step = fast_level - slow_level
-            if noise > 0.0 and step < MIN_STEP_SIGMA * noise:
-                raise gcmd.error(
-                    "Flow step at advance %.4f is only %.1f sigma above "
-                    "noise (fast %.0f, slow %.0f, noise %.0f counts)."
-                    % (advance, step / noise, fast_level, slow_level, noise)
+                overs.append(
+                    100.0
+                    * (max(p[1] for p in peak_window) - fast_level)
+                    / step
                 )
+                tail_span = (slow.end - slow.start) * SETTLED_FRACTION
+                drifts.append(100.0 * abs(slope(slow_tail)) * tail_span / step)
             result = PassResult(advance, k_idx)
-            result.step = step
-            result.undershoot_pct = (
-                100.0 * (slow_level - min(p[1] for p in dip_window)) / step
+            result.step = statistics.fmean(steps)
+            result.undershoot_pct = statistics.fmean(unders)
+            result.overshoot_pct = statistics.fmean(overs)
+            result.drift_pct = statistics.fmean(drifts)
+            result.spread = (
+                statistics.pstdev(unders) if len(unders) > 1 else 0.0
             )
-            result.overshoot_pct = (
-                100.0 * (max(p[1] for p in peak_window) - fast_level) / step
-            )
-            tail_span = (slow.end - slow.start) * SETTLED_FRACTION
-            result.drift_pct = (
-                100.0 * abs(slope(slow_tail)) * tail_span / step
-            )
+            result.edges = len(unders)
             results.append(result)
         results.sort(key=lambda r: r.advance)
         return results
@@ -433,17 +460,19 @@ class PressureAdvanceCalibrate:
 
     def _report(self, gcmd, results, threshold):
         gcmd.respond_info(
-            "advance   undershoot%   overshoot%   tail drift%   step"
+            "advance  undershoot%  +/-   overshoot%  drift%     step  edges"
         )
         for res in results:
             gcmd.respond_info(
-                "%7.4f   %10.2f   %9.2f   %10.2f   %8.0f"
+                "%7.4f  %10.2f %5.2f   %9.2f  %6.2f %8.0f %6d"
                 % (
                     res.advance,
                     res.undershoot_pct,
+                    res.spread,
                     res.overshoot_pct,
                     res.drift_pct,
                     res.step,
+                    res.edges,
                 )
             )
         unsettled = [r for r in results if r.drift_pct > MAX_TAIL_DRIFT * 100.0]
