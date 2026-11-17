@@ -68,8 +68,9 @@ def slope(points):
 class Move:
     """One queued segment of the sweep."""
 
-    def __init__(self, label, seconds, flow, advance):
+    def __init__(self, label, group, seconds, flow, advance):
         self.label = label
+        self.group = group
         self.seconds = seconds
         self.flow = flow
         self.advance = advance
@@ -224,14 +225,27 @@ class PressureAdvanceCalibrate:
     @staticmethod
     def _build_plan(order, prime, cycles, duration, flow_low, flow_high):
         plan = []
-        if prime > 0.0:
-            plan.append(Move("prime", prime, flow_low, order[0]))
+        # Travel direction flips between groups, so chop the prime into
+        # chunks no longer than one cycle. Otherwise a long prime walks
+        # the toolhead off the bed in a single line.
+        chunk = max(duration * 2.0, 1.0)
+        remaining = prime
+        index = 0
+        while remaining > 1e-6:
+            seconds = min(chunk, remaining)
+            plan.append(
+                Move("prime%d" % (index,), "p%d" % (index,), seconds,
+                     flow_low, order[0])
+            )
+            remaining -= seconds
+            index += 1
         for k_idx, advance in enumerate(order):
             for cycle in range(cycles):
                 for kind, flow in (("slow", flow_low), ("fast", flow_high)):
                     plan.append(
                         Move(
                             "k%d_c%d_%s" % (k_idx, cycle, kind),
+                            "k%d" % (k_idx,),
                             duration,
                             flow,
                             advance,
@@ -248,11 +262,9 @@ class PressureAdvanceCalibrate:
         direction = 1.0
         current = None
         for move in plan:
-            if move.label.startswith("k"):
-                k_idx = move.label.split("_")[0]
-                if current is not None and k_idx != current:
-                    direction = -direction
-                current = k_idx
+            if current is not None and move.group != current:
+                direction = -direction
+            current = move.group
             x += direction * xy_speed * move.seconds
             lo = min(lo, x)
             hi = max(hi, x)
@@ -292,11 +304,9 @@ class PressureAdvanceCalibrate:
         current = None
         previous_advance = None
         for move in plan:
-            if move.label.startswith("k"):
-                k_idx = move.label.split("_")[0]
-                if current is not None and k_idx != current:
-                    direction = -direction
-                current = k_idx
+            if current is not None and move.group != current:
+                direction = -direction
+            current = move.group
             if move.advance != previous_advance:
                 # Goes through a lookahead callback unless smooth_time
                 # changes, so motion keeps running across the change.
