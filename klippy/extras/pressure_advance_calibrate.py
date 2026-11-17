@@ -127,7 +127,12 @@ class PressureAdvanceCalibrate:
         xy_speed = gcmd.get_float("TRAVEL_SPEED", 2.0, above=0.0)
         duration = gcmd.get_float("DURATION", 2.0, minval=0.2, maxval=10.0)
         cycles = gcmd.get_int("CYCLES", 5, minval=2, maxval=20)
-        prime = gcmd.get_float("PRIME", 90.0, minval=0.0, maxval=600.0)
+        prime = gcmd.get_float("PRIME", 30.0, minval=0.0, maxval=600.0)
+        # Alternating keeps the purge in one band, but a few grams of
+        # free-air extrudate coils into a tangle tall enough to load the
+        # nozzle and trip the probe's force_safety_limit. Spreading it
+        # along one line costs bed width and avoids that.
+        alternate = gcmd.get_int("ALTERNATE", 0, minval=0, maxval=1)
         settle = gcmd.get_float("SETTLE", 0.5, minval=0.2, maxval=5.0)
         threshold = gcmd.get_float("THRESHOLD", 2.0, above=0.0)
         seed = gcmd.get_int("SEED", 0)
@@ -180,7 +185,7 @@ class PressureAdvanceCalibrate:
                                 flow_high)
         self._check_bounds(gcmd, plan, x0, xy_speed,
                            th_pos[0] - gc_pos[0], status.get("axis_minimum"),
-                           status.get("axis_maximum"))
+                           status.get("axis_maximum"), alternate)
         total = sum(m.seconds for m in plan)
         gcmd.respond_info(
             "Sweeping %i pressure advance values on '%s': %.4f to %.4f in "
@@ -204,7 +209,7 @@ class PressureAdvanceCalibrate:
             gcode.run_script_from_command("M83")
             samples, idle_end, t_start = self._run(
                 gcmd, load_cell, toolhead, gcode, plan, x0, y0, z0,
-                xy_speed, area, settle
+                xy_speed, area, settle, alternate
             )
         finally:
             extruder.instant_corner_v = old_corner_v
@@ -263,7 +268,8 @@ class PressureAdvanceCalibrate:
         return plan
 
     @staticmethod
-    def _check_bounds(gcmd, plan, x0, xy_speed, offset, axis_min, axis_max):
+    def _check_bounds(gcmd, plan, x0, xy_speed, offset, axis_min, axis_max,
+                      alternate):
         # Direction flips per K value, so walk the plan and find the
         # extremes rather than assuming a single straight line.
         x = x0
@@ -271,7 +277,7 @@ class PressureAdvanceCalibrate:
         direction = 1.0
         current = None
         for move in plan:
-            if current is not None and move.group != current:
+            if alternate and current is not None and move.group != current:
                 direction = -direction
             current = move.group
             x += direction * xy_speed * move.seconds
@@ -291,7 +297,7 @@ class PressureAdvanceCalibrate:
             )
 
     def _run(self, gcmd, load_cell, toolhead, gcode, plan, x0, y0, z0,
-             xy_speed, area, settle):
+             xy_speed, area, settle, alternate):
         feed = xy_speed * 60.0
         gcode.run_script_from_command(
             "G1 X%.3f Y%.3f Z%.3f F%.0f" % (x0, y0, z0, feed)
@@ -313,7 +319,7 @@ class PressureAdvanceCalibrate:
         current = None
         previous_advance = None
         for move in plan:
-            if current is not None and move.group != current:
+            if alternate and current is not None and move.group != current:
                 direction = -direction
             current = move.group
             if move.advance != previous_advance:
