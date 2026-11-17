@@ -134,7 +134,7 @@ class PressureAdvanceCalibrate:
         # along one line costs bed width and avoids that.
         alternate = gcmd.get_int("ALTERNATE", 0, minval=0, maxval=1)
         settle = gcmd.get_float("SETTLE", 0.5, minval=0.2, maxval=5.0)
-        threshold = gcmd.get_float("THRESHOLD", 2.0, above=0.0)
+        threshold = gcmd.get_float("THRESHOLD", 3.0, above=0.0)
         seed = gcmd.get_int("SEED", 0)
 
         area = extruder.filament_area
@@ -509,29 +509,58 @@ class PressureAdvanceCalibrate:
                 % (len(unsettled), len(results), MAX_TAIL_DRIFT * 100.0)
             )
             return
-        over = [r for r in results if r.undershoot_pct >= threshold]
+        # Below the knee the undershoot is flat but not at zero: the dip
+        # metric carries a small per-run offset. Measure that flat part
+        # and work relative to it, otherwise an absolute threshold moves
+        # the answer whenever the offset does.
+        flat = max(3, len(results) // 3)
+        baseline = statistics.median(
+            [r.undershoot_pct for r in results[:flat]]
+        )
+        level = baseline + threshold
+        gcmd.respond_info(
+            "Flat baseline over the lowest %i values: %.2f%%, so the knee is "
+            "where undershoot passes %.2f%%." % (flat, baseline, level)
+        )
+        over = [r for r in results if r.undershoot_pct >= level]
         if not over:
             gcmd.respond_info(
-                "No undershoot above %.1f%% anywhere in the sweep. The value "
-                "is above STOP=%.4f - extend the range."
+                "Undershoot never rises %.1f%% above baseline. The value is "
+                "above STOP=%.4f - extend the range."
                 % (threshold, results[-1].advance)
             )
             return
         first = over[0]
-        if first is results[0]:
+        index = results.index(first)
+        if index == 0:
             gcmd.respond_info(
-                "Already undershooting %.2f%% at the lowest value tested. The "
-                "value is below START=%.4f - extend the range downward."
-                % (first.undershoot_pct, results[0].advance)
+                "Already %.2f%% above baseline at the lowest value tested. "
+                "The value is below START=%.4f - extend the range downward."
+                % (first.undershoot_pct - baseline, results[0].advance)
             )
             return
-        chosen = results[results.index(first) - 1]
+        # Interpolate across the bracketing pair so the answer is not
+        # pinned to the sweep grid.
+        low = results[index - 1]
+        rise = first.undershoot_pct - low.undershoot_pct
+        chosen = low.advance
+        if rise > 0.0:
+            chosen = low.advance + (level - low.undershoot_pct) * (
+                first.advance - low.advance
+            ) / rise
         gcmd.respond_info(
-            "Undershoot crosses %.1f%% at %.4f, so the last good value is "
-            "%.4f." % (threshold, first.advance, chosen.advance)
+            "Knee is between %.4f (%.2f%%) and %.4f (%.2f%%), crossing at "
+            "%.4f."
+            % (
+                low.advance,
+                low.undershoot_pct,
+                first.advance,
+                first.undershoot_pct,
+                chosen,
+            )
         )
         gcmd.respond_info(
-            "Set it with: SET_PRESSURE_ADVANCE ADVANCE=%.4f" % (chosen.advance,)
+            "Set it with: SET_PRESSURE_ADVANCE ADVANCE=%.4f" % (chosen,)
         )
 
 
