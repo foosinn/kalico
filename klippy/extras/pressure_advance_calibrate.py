@@ -225,19 +225,28 @@ class PressureAdvanceCalibrate:
     @staticmethod
     def _build_plan(order, prime, cycles, duration, flow_low, flow_high):
         plan = []
-        # Travel direction flips between groups, so chop the prime into
-        # chunks no longer than one cycle. Otherwise a long prime walks
-        # the toolhead off the bed in a single line.
-        chunk = max(duration * 2.0, 1.0)
+        # Prime with the same slow/fast cycle that will be measured, not
+        # a steady low flow. The melt equilibrates to the mean flow, so
+        # priming at flow_low leaves the first K values climbing toward
+        # the cycle's mean and that climb can outrun the step itself.
+        # One group per cycle keeps the travel in a band.
         remaining = prime
         index = 0
         while remaining > 1e-6:
-            seconds = min(chunk, remaining)
-            plan.append(
-                Move("prime%d" % (index,), "p%d" % (index,), seconds,
-                     flow_low, order[0])
-            )
-            remaining -= seconds
+            for kind, flow in (("slow", flow_low), ("fast", flow_high)):
+                if remaining <= 1e-6:
+                    break
+                seconds = min(duration, remaining)
+                plan.append(
+                    Move(
+                        "prime%d_%s" % (index, kind),
+                        "p%d" % (index,),
+                        seconds,
+                        flow,
+                        order[0],
+                    )
+                )
+                remaining -= seconds
             index += 1
         for k_idx, advance in enumerate(order):
             for cycle in range(cycles):
